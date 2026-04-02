@@ -1,15 +1,14 @@
 name: Vercel 保活（消灭冷启动，飞书3秒校验必过）
 on:
   schedule:
-    # 每5分钟唤醒一次，GitHub免费额度完全够用
     - cron: '*/5 * * * *'
-  workflow_dispatch: # 支持手动触发
+  workflow_dispatch:
 jobs:
   ping-vercel:
     runs-on: ubuntu-latest
     steps:
       - name: 唤醒Vercel
         run: |
-          # 把这里换成你自己的Vercel域名！
+          # 替换成你的Vercel域名！
           curl -s https://feishu-bot-blush.vercel.app/ping
           echo "✅ Vercel已唤醒，冷启动已消灭"
