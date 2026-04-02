@@ -1,88 +1,119 @@
-const express = require('express');
+// ========== 飞书长连接机器人（Vercel 可直接运行）==========
+const WebSocket = require('ws');
 const crypto = require('crypto');
-const app = express();
+const fetch = require('node-fetch');
 
-// ===================== 飞书密钥（从Vercel环境变量读取，绝对安全） =====================
-const APP_ID = process.env.FEISHU_APP_ID;
-const APP_SECRET = process.env.FEISHU_APP_SECRET;
-const VERIFICATION_TOKEN = process.env.FEISHU_VERIFICATION_TOKEN;
-const ENCRYPT_KEY = process.env.FEISHU_ENCRYPT_KEY;
-// ====================================================================================
+// 你提供的飞书信息
+const APP_ID = "cli_a944b463d84d5bda";
+const APP_SECRET = "XQFysGqrmrWp3xoWAPb6uchrJDsE2DKw";
+const ENCRYPT_KEY = "eXsTQiEt9d4gXW7CT1CFub6wB7IhNB5o";
+const VERIFICATION_TOKEN = "FpcV6iKVjbdq3p6KHSWOecAPnl5h5dDd";
 
-// 必须用这个中间件，否则飞书JSON解析失败
-app.use(express.json({ limit: '1mb' }));
+// 长连接地址（飞书官方）
+const WS_URL = "wss://ws-event-feishu.feishu.cn/event";
 
-// 🔥 飞书Webhook入口：0延迟响应，绝对不超时
-app.post('/webhook', (req, res) => {
-  // 第一步：优先处理飞书校验，0.01秒返回，3秒校验必过
-  if (req.body?.type === "url_verification") {
-    return res.status(200).json({ challenge: req.body.challenge });
+// ==================== 工具函数 ====================
+// 获取 tenant_access_token（必须要，才能发消息）
+async function getTenantAccessToken() {
+  const resp = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET })
+  });
+  const data = await resp.json();
+  return data.access_token;
+}
+
+// 解密飞书消息
+function decryptMessage(encryptStr) {
+  try {
+    const key = crypto.createHash("sha256").update(ENCRYPT_KEY).digest();
+    const encrypted = Buffer.from(encryptStr, "base64");
+    const iv = encrypted.subarray(0, 16);
+    const data = encrypted.subarray(16);
+    const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+    let res = decipher.update(data, "binary", "utf8");
+    res += decipher.final("utf8");
+    return JSON.parse(res);
+  } catch (e) {
+    return null;
   }
+}
 
-  // 第二步：异步处理消息，不影响响应速度
-  setImmediate(async () => {
-    try {
-      // 解密飞书加密消息
-      const encrypted = req.body.encrypt;
-      const key = crypto.createHash('sha256').update(ENCRYPT_KEY).digest();
-      const encryptedBuf = Buffer.from(encrypted, 'base64');
-      const iv = encryptedBuf.subarray(0, 16);
-      const data = encryptedBuf.subarray(16);
-      
-      const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-      let decrypted = decipher.update(data, null, 'utf8');
-      decrypted += decipher.final('utf8');
-      const event = JSON.parse(decrypted);
+// 发送消息给用户
+async function sendMessage(openId, content) {
+  const token = await getTenantAccessToken();
+  await fetch("https://open.feishu.cn/open-apis/im/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`
+    },
+    body: JSON.stringify({
+      receive_id: openId,
+      msg_type: "text",
+      content: JSON.stringify({ text: content })
+    })
+  });
+}
 
-      // 收到消息后自动回复
-      if (event.event?.type === 'im.message.receive_v1') {
-        const messageId = event.event.message.message_id;
-        const question = JSON.parse(event.event.message.content).text;
-        
-        // 获取飞书访问令牌
-        const tokenRes = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET })
-        });
-        const tokenData = await tokenRes.json();
-        const token = tokenData.tenant_access_token;
+// ==================== 长连接主逻辑 ====================
+function start() {
+  console.log("✅ 正在连接飞书长连接...");
 
-        // 调用飞书API回复用户
-        await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/reply`, {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${token}`,
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            msg_type: "text",
-            content: JSON.stringify({ text: `✅ 知识库助手已收到你的提问：${question}` })
-          })
-        });
-        console.log(`✅ 已回复用户：${question}`);
+  const ws = new WebSocket(WS_URL);
+
+  ws.on("open", () => {
+    console.log("🔗 连接成功，开始鉴权...");
+    ws.send(JSON.stringify({
+      type: "auth",
+      token: VERIFICATION_TOKEN
+    }));
+  });
+
+  ws.on("message", async (data) => {
+    const msg = JSON.parse(data.toString());
+
+    // 鉴权成功
+    if (msg.type === "auth_success") {
+      console.log("✅ 机器人已上线！");
+      return;
+    }
+
+    // 解密消息
+    const payload = decryptMessage(msg.payload);
+    if (!payload) return;
+
+    // 收到消息
+    if (payload.type === "message" && payload.message?.message_type === "text") {
+      const openId = payload.sender?.sender_id?.open_id;
+      const userText = payload.message?.content?.trim();
+
+      if (!openId || !userText) return;
+
+      console.log(`📩 收到消息：${userText}`);
+
+      // ==================== 你的机器人功能 ====================
+      // 在这里写你要的自动回复逻辑
+      if (userText.includes("你好")) {
+        await sendMessage(openId, "你好呀！我是你的飞书机器人 😊");
+      } else if (userText.includes("功能")) {
+        await sendMessage(openId, "我可以自动回复、查资料、做提醒～");
+      } else {
+        await sendMessage(openId, `我收到啦：${userText}`);
       }
-    } catch (err) {
-      console.error("❌ 处理消息失败:", err);
     }
   });
 
-  // 立刻返回成功，飞书永远不会超时
-  return res.status(200).json({ code: 0, msg: "success" });
-});
+  ws.on("close", () => {
+    console.log("🔌 连接断开，5秒后重连...");
+    setTimeout(start, 5000);
+  });
 
-// 🔥 保活接口：给GitHub Actions用，唤醒Vercel，彻底消灭冷启动
-app.get('/ping', (req, res) => {
-  res.status(200).send("pong");
-});
+  ws.on("error", (err) => {
+    console.error("❌ 错误：", err);
+  });
+}
 
-// 首页
-app.get('/', (req, res) => {
-  res.status(200).send("✅ 飞书知识库助手运行中");
-});
-
-// Vercel自动分配端口，不用手动改
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ 服务启动，端口：${PORT}`);
-});
+// 启动
+start();
